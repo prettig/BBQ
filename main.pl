@@ -194,8 +194,6 @@ else ################################################################# SENDER MO
     -highlightthickness => 0
   )->pack(-expand => 1, -fill => 'both');
 
-  #$hlist->bind('<3>', [\&open_file]);
-  #my $b =  $hlist->Button(-background => "bisque",-anchor => 'center',-text => "ID",-command => sub { print "You pressed Header 0\n";});
   my $headerstyle   = $hlist->ItemStyle('window', -padx => 0, -pady => 0);
 
   my $h0 = $hlist->HdrResizeButton(-text => 'ID', relief => 'flat', -pady => 0, -command => [\&sort_hlist, 0], -column => 0);
@@ -418,6 +416,7 @@ else ################################################################# SENDER MO
     }
   }
 
+  # Fire all rules sequentially
   sub fire_all()
   {
     foreach my $row (0 .. $item_counter - 1)
@@ -444,7 +443,7 @@ else ################################################################# SENDER MO
     my $endtime = time() + ($time ? $time : 1000000);
 
     socket("flood", PF_INET, SOCK_DGRAM, 17);
-
+# disabled for faster debugging
   #  for (;time() <= $endtime;) {
   #    my $psize = $size ? $size : int(rand(1024-64)+64) ;
   #    my $pport = $port ? $port : int(rand(65500))+1;
@@ -588,7 +587,6 @@ else ################################################################# SENDER MO
             }
             else
             {
-              #$proto{data} .= $s;
               my @ws = split(//, $s);
               foreach my $ascii (@ws)
               {
@@ -618,13 +616,52 @@ else ################################################################# SENDER MO
 
         if ($byte_test) # WORK IN PROGRESS
         {
-          $proto{data} .= "12345";
+          $proto{data} .= $byte_test;
         }
       }
       elsif ($key =~ /byte_test/)
       {
-        print "Got byte_test. Appending 1.\n";
-        $byte_test = 1;
+        print "Got byte_test\n";
+        my @btest = split(/,/, $add_data);
+        my $bytes_to_convert = $btest[0];
+        my $operator = $btest[1];
+        my $value = $btest[2];
+        my $offset = $btest[3];
+
+        # TODO: [,relative] [,<endian>] [,<number type>, string]
+        $byte_test .= $offset * " ";
+        my $fake;
+        if ($operator =~ /=/)
+        {
+          $fake = $value;
+        }
+        elsif ($operator =~ /</)
+        {
+          $fake = $value - 1;
+        }
+        elsif ($operator =~ />/)
+        {
+          $fake = $value + 1;
+        }
+        elsif ($operator =~ /&/) # TODO: &, ^
+        {
+          print "[ERROR] Bitwise AND detected in byte_test. Not yet implemented.\n";
+          next;
+        }
+        elsif ($operator =~ /^/)
+        {
+          print "[ERROR] Bitwise OR detected in byte_test. Not yet implemented.\n";
+          next;
+        }
+
+        print "Fake is \"$fake\"\n";
+
+        while (length($fake < $bytes_to_convert))
+        {
+          # prepend zeros until the correct length is achieved
+          $fake = "0$fake";
+        }
+        $byte_test = $fake;
       }
       # TIME TO LIVE
       elsif ($key =~ /ttl/)
