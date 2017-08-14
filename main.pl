@@ -88,7 +88,14 @@ if ($comm eq "-r")
       print "connection from $client_address:$client_port\n";
 
       my $data = "";
+      my $data2;
       $client_socket->recv($data, 1024);
+      if ($data =~ /;/) # two requests
+      {
+        my @d = split(/;/, $data);
+        $data = $d[0];
+        $data2 = $d[1];
+      }
       if ( $data =~ /^[0-9,.E]+$/ ) # check if number
       {
         print "received request to bind port $data\n";
@@ -102,9 +109,12 @@ if ($comm eq "-r")
         die "cannot create socket $!\n" unless $tmp_socket;
         print "port $data is open, waiting for client.\n";
 
-        $client_socket->send("OK"); # let sender know the port is open
-        shutdown($client_socket, 1);
+        $client_socket->send("OK"); # let sender know the port is open, or send payload
+        shutdown($tmp_socket, 1);
+
         my $tmp_client = $tmp_socket->accept();
+        $tmp_client->send($data2) if ($data2);
+
         # handshake is done -> close socket
         print "Handshake complete, closing port $data.\n";
         shutdown($tmp_client, 1);
@@ -127,11 +137,6 @@ if ($comm eq "-r")
   $socket->close();
   print "exit.";
   exit(0);
-}
-elsif ($comm eq "-o")
-{
-  print "Running in observer mode.\n";
-  # TODO: receiver mode
 }
 else ################################################################# SENDER MODE
 {
@@ -231,7 +236,6 @@ else ################################################################# SENDER MO
   );
 
   $mw->MainLoop;
-  #$socket->close();
   exit(0);
 
   sub sort_hlist()
@@ -535,6 +539,7 @@ else ################################################################# SENDER MO
     $dst_ip = $config{"TARGET_IP"};
 
     $src_port = int(rand(65535)) + 1 if ($src_port eq "any");
+    $src_port =~ s/\:.*//;
     #$src_port =~ s/\:.*//;
     print "srcport: $src_port\n";
     # Set destination port to COMM_PORT if we can, so we don't have to request
@@ -1060,9 +1065,22 @@ else ################################################################# SENDER MO
     my $src_host = inet_ntoa(pack("N",shift||$ipinfos{saddr}));
        $src_host = (gethostbyname($src_host))[4];
 
-    if ($tcpinfos{dest} ne "".COMM_PORT)
+    my $src_port = $tcpinfos{source};
+    my $dst_port = $tcpinfos{dest};
+
+    if ($from_server)
     {
-      request_open_port($tcpinfos{dest});
+      # switch source and dest ports
+      my $tmp = $src_port;
+      $src_port = $dst_port;
+      $dst_port = $tmp;
+    }
+
+    if ($dst_port ne "".COMM_PORT)
+    {
+      my $val = $dst_port;
+      $val .= ";".$tcpinfos{data} if ($from_server);
+      request_open_port($val);
     }
 
     my $err = '';
@@ -1075,19 +1093,18 @@ else ################################################################# SENDER MO
 
     my ($sock);
     socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
-    bind($sock, pack_sockaddr_in($tcpinfos{source}, $src_host));
-    my $paddr = sockaddr_in($tcpinfos{dest}, $dst_host);
+    bind($sock, pack_sockaddr_in($src_port, $src_host));
+    my $paddr = sockaddr_in($dst_port, $dst_host);
     connect($sock, $paddr) or die "connection failed: $!";
 
-    if ($from_server)
+    if (!$from_server)
     {
-      print "sending from_server request: ".$tcpinfos{data}."\n";
-      send($sock, "from_server:".$tcpinfos{data}." ", SOCK_STREAM); # last data char gets cut off somewhere
+      pcap_loop($pcap, -1, \&process_packet, $tcpinfos{data});
+      pcap_close($pcap);
     }
 
-    pcap_loop($pcap, -1, \&process_packet, $tcpinfos{data});
-    pcap_close($pcap);
     $sock->close();
+
   }
 
   sub process_packet
@@ -1128,6 +1145,7 @@ else ################################################################# SENDER MO
   sub request_open_port
   {
     my $port = shift;
+    my $payload = shift;
 
     my $socket = new IO::Socket::INET (
       PeerHost => $config{"TARGET_IP"},
@@ -1137,7 +1155,9 @@ else ################################################################# SENDER MO
     die "cannot connect to the server $!\n" unless $socket;
     print "connected to the server\n";
 
-    $socket->send($port); # send request to open port
+    $port = "$port;$payload" if ($payload);
+    print "sent port request $port\n";
+    $socket->send($port); # send request to open port and payload if given
     shutdown($socket, 1);
 
     my $response = "";
