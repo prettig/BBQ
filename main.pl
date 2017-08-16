@@ -407,12 +407,17 @@ else ################################################################# SENDER MO
             my @spl = split(/,/, $d);
             $flowbits_set{$spl[1]} = \@all_elements;
           }
-        }
-        # don't show the alert if it has the noalert keyword or unsupported keywords
-        if ($k =~ /noalert/ || $k =~ /pcre/)
-        {
-          $dontadd = 1; # if the rule triggers no alert, we don't need to let the user fire it
+          # if the rule triggers no alert, we don't need to let the user fire it
           # it may be used to set a flowbit though
+          if ($d =~ /noalert/)
+          {
+            $dontadd = 1;
+          }
+        }
+        # don't show the alert if it has unsupported keywords
+        if ($k =~ /pcre/)
+        {
+          $dontadd = 1;
         }
       }
 
@@ -599,6 +604,7 @@ else ################################################################# SENDER MO
     my $handshake = 0;
     my @payload = ();
     my @last_byte_test_offset = ();
+    my $repeat = 1;
 
     foreach my $key (sort keys %{ $additional_data{$id} })
     {
@@ -781,6 +787,16 @@ else ################################################################# SENDER MO
           $proto{code} = $add_data;
         }
       }
+      elsif ($key =~ /^threshold/)
+      {
+        # rules with the threshold keyword may either alert only after x matches,
+        # or up until x matches. To trigger former rules, our packet has to be
+        # sent multiple times.
+        my @spl = split(/,/, $add_data);
+        my $type = (split (/ /, $spl[0]))[1];
+        my $count =  (split (/ /, $spl[2]))[1];
+        $repeat = $count if ($type =~ /threshold/ || $type =~ /both/);
+      }
       # ICMP TYPE
       elsif ($key =~ /itype/)
       {
@@ -926,48 +942,51 @@ else ################################################################# SENDER MO
 
     $proto{data} = join("", @payload);
 
-    if ($protocol eq "tcp" || $protocol eq "ip")
+    for (my $i = 0; $i < $repeat; $i++)
     {
-        $rawIP_tcp->set({
-          %ip,
-          tcp => { %proto }
-        });
+      if ($protocol eq "tcp" || $protocol eq "ip")
+      {
+          $rawIP_tcp->set({
+            %ip,
+            tcp => { %proto }
+          });
 
-        print "Target port is: ".$ip{ip}{saddr}.":".$proto{source}."\n";
-        if (!$handshake && !$from_server)
-        {
-          $rawIP_tcp->send;
-          print "Sent TCP packet.\n";
-        }
-        else
-        {
-          print "Requiring handshake.\n";
-          tcp_handshake($rawIP_tcp, $from_server);
-        }
-    }
-    elsif ($protocol eq "udp")
-    {
-        print "payload: ".$proto{data}."\n";
-        $rawIP_udp->set({
-          %ip,
-          udp => { %proto }
-        });
-        $rawIP_udp->send;
-        print "Sent UDP packet to $dst_ip\n";
-    }
-    elsif ($protocol eq "icmp")
-    {
-        $rawIP_icmp->set({
-          %ip,
-          icmp => { %proto }
-        });
-        $rawIP_icmp->send;
-        print "Sent ICMP packet to $dst_ip\n";
-    }
-    else
-    {
-      print "[ERROR] unsupported protocol \"$protocol\".\n";
-      return;
+          print "Target port is: ".$ip{ip}{saddr}.":".$proto{source}."\n";
+          if (!$handshake && !$from_server)
+          {
+            $rawIP_tcp->send;
+            print "Sent TCP packet.\n";
+          }
+          else
+          {
+            print "Requiring handshake.\n";
+            tcp_handshake($rawIP_tcp, $from_server);
+          }
+      }
+      elsif ($protocol eq "udp")
+      {
+          print "payload: ".$proto{data}."\n";
+          $rawIP_udp->set({
+            %ip,
+            udp => { %proto }
+          });
+          $rawIP_udp->send;
+          print "Sent UDP packet to $dst_ip\n";
+      }
+      elsif ($protocol eq "icmp")
+      {
+          $rawIP_icmp->set({
+            %ip,
+            icmp => { %proto }
+          });
+          $rawIP_icmp->send;
+          print "Sent ICMP packet to $dst_ip\n";
+      }
+      else
+      {
+        print "[ERROR] unsupported protocol \"$protocol\".\n";
+        return;
+      }
     }
   }
 
