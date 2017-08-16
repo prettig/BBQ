@@ -13,6 +13,8 @@ use Net::RawIP;
 use NetAddr::IP;
 use Net::Pcap;
 
+use URI::Normalize qw( normalize_uri );
+
 use IO::Socket::INET;
 use Socket;
 use Sys::Hostname qw(hostname);
@@ -151,6 +153,7 @@ else ################################################################# SENDER MO
 
   my $pcap;
   my $item_counter = 0;
+  my %flowbits_set = ();
 
   # initialize main window
   my $mw = Tk::MainWindow->new;
@@ -356,22 +359,12 @@ else ################################################################# SENDER MO
     $item_counter = 0;
     %additional_data = ();
     while (my $row = <$fh>) {
-      my @elements = split / /, $row;
-      if ($elements[0] eq '#' || substr($row, 0, 1) eq '#' || scalar(@elements) < 2){ next; } # skip comments
-
-      $hlist->add($item_counter);
-      $hlist->itemCreate($item_counter, 0, -text => $item_counter);
-      $hlist->itemCreate($item_counter, 1, -text => $elements[0]);
-      $hlist->itemCreate($item_counter, 2, -text => $elements[1]);
-      $hlist->itemCreate($item_counter, 3, -text => $elements[2]);
-      $hlist->itemCreate($item_counter, 4, -text => $elements[3]);
-      $hlist->itemCreate($item_counter, 5, -text => $elements[4]);
-      $hlist->itemCreate($item_counter, 6, -text => $elements[5]);
-      $hlist->itemCreate($item_counter, 7, -text => $elements[6]);
+      my @all_elements = split / /, $row;
+      if ($all_elements[0] eq '#' || substr($row, 0, 1) eq '#' || scalar(@all_elements) < 2){ next; } # skip comments
 
       my ($options) = $row =~ /\((.*?)\)/; # extract options part in brackets
       $options =~ s/\"//g;                 # remove " from string
-      @elements = split /;/, $options;
+      my @elements = split /;/, $options;
 
       my %optionlist = ();
 
@@ -385,11 +378,57 @@ else ################################################################# SENDER MO
 
         $counter{$expr[0]} = 0 if (!exists $counter{$expr[0]});
         my $key = $expr[0].".".$counter{$expr[0]};
+
+        # assign these keywords to their respective content
+        if ($expr[0] eq "byte_test" || $expr[0] eq "offset")
+        {
+          # there mustve already been at least one content key
+          # prepend "y" to make sure this will be processed after content
+          $key = "y".$expr[0].".".($counter{"content"} - 1);
+        }
+        if ($expr[0] eq "distance")
+        {
+          # distance can depend on byte_test and offset, so it has to be processed later
+          $key = "z".$expr[0].".".($counter{"content"} - 1);
+        }
         $counter{$expr[0]} ++;
         $optionlist{$key} = $expr[1];
       }
 
-      $hlist->itemCreate($item_counter, 8, -text => "" . $optionlist{"msg.0"});
+      my $dontadd = 0;
+      foreach my $k (keys %optionlist)
+      {
+        my $d = $optionlist{$k};
+        if ($k =~ /flowbits/)
+        {
+          # e.g. flowbits:set,backdoor.asylum.connect
+          if ($d =~ /^set/)
+          {
+            my @spl = split(/,/, $d);
+            $flowbits_set{$spl[1]} = \@all_elements;
+          }
+        }
+        # don't show the alert if it has the noalert keyword or unsupported keywords
+        if ($k =~ /noalert/ || $k =~ /pcre/)
+        {
+          $dontadd = 1; # if the rule triggers no alert, we don't need to let the user fire it
+          # it may be used to set a flowbit though
+        }
+      }
+
+      if (!$dontadd)
+      {
+        $hlist->add($item_counter);
+        $hlist->itemCreate($item_counter, 0, -text => $item_counter);
+        $hlist->itemCreate($item_counter, 1, -text => $all_elements[0]);
+        $hlist->itemCreate($item_counter, 2, -text => $all_elements[1]);
+        $hlist->itemCreate($item_counter, 3, -text => $all_elements[2]);
+        $hlist->itemCreate($item_counter, 4, -text => $all_elements[3]);
+        $hlist->itemCreate($item_counter, 5, -text => $all_elements[4]);
+        $hlist->itemCreate($item_counter, 6, -text => $all_elements[5]);
+        $hlist->itemCreate($item_counter, 7, -text => $all_elements[6]);
+        $hlist->itemCreate($item_counter, 8, -text => "" . $optionlist{"msg.0"});
+      }
       $additional_data{$item_counter} = \%optionlist;
 
       $item_counter++;
@@ -558,15 +597,17 @@ else ################################################################# SENDER MO
 
     my $ttl = 255;
     my $handshake = 0;
-    my $byte_test = 0;
+    my @payload = ();
+    my @last_byte_test_offset = ();
 
     foreach my $key (sort keys %{ $additional_data{$id} })
     {
       my $add_data = $additional_data{$id}{$key};
 
       # CONTENT
-      if ($key =~ /content/)
+      if ($key =~ /^content/)
       {
+        my $content = "";
         print "got $key: $add_data\n";
         if ($add_data =~ /\|/)
         {
@@ -587,7 +628,7 @@ else ################################################################# SENDER MO
               {
                 print "hex $s to ".chr(hex $hex)."\n";
                 # Translate hex
-                $proto{data} .= chr(hex $hex);
+                $content .= chr(hex $hex);
               }
             }
             else
@@ -597,9 +638,9 @@ else ################################################################# SENDER MO
               {
                 my $hex_string = unpack "H*", $ascii;
                 # Translate hex
-                $proto{data} .= chr(hex $hex_string);
+                $content .= chr(hex $hex_string);
               }
-              print "Payload is now \"".$proto{data}."\"\n";
+              print "Payload is now \"".$content."\"\n";
             }
             $is_hex = !$is_hex;
           }
@@ -615,18 +656,51 @@ else ################################################################# SENDER MO
           {
             my $hex_string = unpack "H*", $ascii;
             # Translate hex
-            $proto{data} .= chr(hex $hex_string);
+            $content .= chr(hex $hex_string);
           }
         }
 
-        if ($byte_test) # WORK IN PROGRESS
+        push (@payload, $content);
+      }
+      elsif ($key =~ /^uricontent/)
+      {
+        push (@payload, normalize_uri($add_data));
+      }
+      elsif ($key =~ /offset/)
+      {
+        print "offset?: $key\n";
+        print "offset: $add_data\n";
+        my $payload_index = (split(/\./, $key))[1];
+        print "index = $payload_index\n";
+        print "detected offset for content: ".$payload[$payload_index]."\n";
+        my $pld = "";
+        for (my $i = 0; $i < $payload_index; $i++)
         {
-          $proto{data} .= $byte_test;
+          $pld .= $payload[$i];
         }
+
+        my $diff = $add_data - length($pld);
+        print "diff: $diff\n";
+        $payload[$payload_index] = 'x' x $diff . $payload[$payload_index] if ($diff > 0);
+        print "new content: ".$payload[$payload_index]."\n";
+      }
+      elsif ($key =~ /distance/)
+      {
+        my $payload_index = (split(/\./, $key))[1];
+        my $off = 0;
+        print "LAST BYTE OFFSET:\n";
+        print "$payload_index: ".$last_byte_test_offset[$payload_index] ."\n";
+        if ($last_byte_test_offset[$payload_index])
+        {
+          $off = $last_byte_test_offset[$payload_index];
+          print "last bytetest offset was $off\n";
+        }
+        $payload[$payload_index] = 'x' x ($add_data - $off) . $payload[$payload_index];
       }
       elsif ($key =~ /byte_test/)
       {
         print "Got byte_test\n";
+        my $payload_index = (split(/\./, $key))[1];
         my @btest = split(/,/, $add_data);
         my $bytes_to_convert = $btest[0];
         my $operator = $btest[1];
@@ -634,7 +708,7 @@ else ################################################################# SENDER MO
         my $offset = $btest[3];
 
         # TODO: [,relative] [,<endian>] [,<number type>, string]
-        $byte_test .= $offset * " ";
+      #  my $byte_test .= int($offset) x " ";
         my $fake;
         if ($operator =~ /=/)
         {
@@ -648,25 +722,23 @@ else ################################################################# SENDER MO
         {
           $fake = $value + 1;
         }
-        elsif ($operator =~ /&/) # TODO: &, ^
+        elsif ($operator =~ /&/ || /^/)
         {
-          print "[ERROR] Bitwise AND detected in byte_test. Not yet implemented.\n";
-          next;
-        }
-        elsif ($operator =~ /^/)
-        {
-          print "[ERROR] Bitwise OR detected in byte_test. Not yet implemented.\n";
-          next;
+           # AND can only be true if 1 & 1
+           # OR is always true if a 1 occurs
+          $fake = "1";
         }
 
+        while (length($fake) < $bytes_to_convert)
+        {
+          $fake .= $fake;
+        }
+        print "offset is: $offset\n";
+        $fake = "0" x $offset . $fake;
         print "Fake is \"$fake\"\n";
-
-        while (length($fake < $bytes_to_convert))
-        {
-          # prepend zeros until the correct length is achieved
-          $fake = "0$fake";
-        }
-        $byte_test = $fake;
+        print "Fake length \@$payload_index: ".length($fake)."\n";
+        $last_byte_test_offset[$payload_index+1] = length($fake);
+        $payload[$payload_index] .= $fake;
       }
       # TIME TO LIVE
       elsif ($key =~ /ttl/)
@@ -812,7 +884,7 @@ else ################################################################# SENDER MO
       #      [,(to_client|to_server|from_client|from_server)]
       #      [,(no_stream|only_stream)]
       #      [,(no_frag|only_frag)];
-      elsif ($key =~ /flow/)
+      elsif ($key =~ /flow\./)
       {
         print "flowdata: $add_data\n";
         if ($add_data =~ /established/) # equal to flag "+A"
@@ -826,6 +898,20 @@ else ################################################################# SENDER MO
           $from_server = 1;
         }
       }
+      elsif ($key =~ /flowbits/)
+      {
+        print "Rule has flowbits.\n";
+        if ($add_data =~ /isset/)
+        {
+          my @d = split(/,/, $add_data);
+          my $bit = $d[1];
+          if ($flowbits_set{$bit})
+          {
+            print "Needs $bit\n";
+            print "ID: ".$flowbits_set{$bit}[0]."\n";
+          }
+        }
+      }
       # MESSAGE
       elsif ($key =~ /msg/)
       {
@@ -837,6 +923,8 @@ else ################################################################# SENDER MO
         print "[WARNING] Rule option \"$key\" is not supported.\n";
       }
     }
+
+    $proto{data} = join("", @payload);
 
     if ($protocol eq "tcp" || $protocol eq "ip")
     {
@@ -859,11 +947,7 @@ else ################################################################# SENDER MO
     }
     elsif ($protocol eq "udp")
     {
-      print "payload: ".$proto{data}."\n";
-      for my $key (keys %proto)
-      {
-        print $key.": ".$proto{$key}."\n";
-      }
+        print "payload: ".$proto{data}."\n";
         $rawIP_udp->set({
           %ip,
           udp => { %proto }
