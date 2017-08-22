@@ -406,14 +406,14 @@ else ################################################################# SENDER MO
             $flowbits_set{$spl[1]} = \@all_elements;
           }
           # if the rule triggers no alert, we don't need to let the user fire it
-          # it may be used to set a flowbit though
+          # they may be used to set a flowbit though
           if ($d =~ /noalert/)
           {
             $dontadd = 1;
           }
         }
         # don't show the alert if it has unsupported keywords
-        if ($k =~ /pcre/ || $k =~/flowbits/)
+        if ($k =~ /pcre/ || $k =~/flowbits/ || $k =~ /sameip/)
         {
           $dontadd = 1;
         }
@@ -987,6 +987,28 @@ else ################################################################# SENDER MO
           }
         }
         $rawIP_tcp->set({ tcp => {res2 => $cwr_ece} });
+      }
+      elsif ($key =~ /fragbits/)
+      {
+        # RawIP sets the ip flags via the fragment offset (frag_off)
+        # Flags are 3 bits wide and the offset 13 bits -> 16 bits total
+        # Flags are Bit 0: Reserved, Bit 1: Don't Fragment (DF), Bit 2: More Fragments (MF)
+
+        # R  DF MF < --  F R A G M E N T   O F F S E T  -->
+        # 0  0  0  0   0  0  0  0   0  0  0  0   0  0  0  0
+
+        next if ($add_data =~ /!/);
+        my $m = 0;
+        my $d = 0;
+        my $r = 0;
+
+        $m = 1 if $add_data =~ /M/;
+        $d = 1 if $add_data =~ /D/;
+        $r = 1 if $add_data =~ /R/;
+        my $rdm = $r . $d . $m . "0" x 13;
+        my $val = oct("0b" . $rdm);
+
+        $ip{ip}{frag_off} = $val;
       }
       # ACKNOWLEDGEMENT (TCP)
       elsif ($key =~ /:ack/)
