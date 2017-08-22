@@ -65,7 +65,7 @@ read_config();
 if ($comm eq "-r")
 {
   print "Running in receiver mode.\n";
-
+  print `/etc/init.d/apache2 start`;
   # auto-flush on socket
   $| = 1;
 
@@ -102,6 +102,8 @@ if ($comm eq "-r")
       if ( $data =~ /^[0-9,.E]+$/ ) # check if number
       {
         print "received request to bind port $data\n";
+        print `/etc/init.d/apache2 stop` if ($data eq "80");
+
         my $tmp_socket = new IO::Socket::INET (
             LocalHost => $config{"TARGET_IP"},
             LocalPort => $data,
@@ -122,6 +124,7 @@ if ($comm eq "-r")
         print "Handshake complete, closing port $data.\n";
         shutdown($tmp_client, 1);
         $tmp_socket->close();
+        print `/etc/init.d/apache2 start` if ($data eq "80");
       }
       elsif ( $data =~ /from_server/)
       {
@@ -672,9 +675,6 @@ else ################################################################# SENDER MO
         else
         {
           print "Payload \"".$add_data."\" has no hex data.\n";
-          # This is a weird workaround, but for some reason rawIP does not accept $add_data
-          # it works if the value of $add_data was given directly ($proto{data} .= "XYZ")
-          # I try to achieve this by converting the chars to hex and back
           my @ws = split(//, $add_data);
           foreach my $ascii (@ws)
           {
@@ -723,7 +723,7 @@ else ################################################################# SENDER MO
           substr($payload, $length_last_content, 0, 'x' x $diff) if ($diff > 0);
           print "new content: $payload\n";
         }
-        $doe = $add_data;
+        $doe = $add_data + $length_last_content;
       }
       elsif ($key =~ /distance/)
       {
@@ -1012,6 +1012,9 @@ else ################################################################# SENDER MO
       }
       elsif ($key =~ /:ip_proto$/)
       {
+        # look protocols up in /etc/protocols
+        # Note: this is platform dependent
+
         open(my $fh, '<:encoding(UTF-8)', "/etc/protocols")
           or die "Could not open protocols file: $!";
 
