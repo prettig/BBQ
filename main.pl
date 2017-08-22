@@ -1010,6 +1010,76 @@ else ################################################################# SENDER MO
 
         $ip{ip}{frag_off} = $val;
       }
+      elsif ($key =~ /:ip_proto$/)
+      {
+        open(my $fh, '<:encoding(UTF-8)', "/etc/protocols")
+          or die "Could not open protocols file: $!";
+
+        my %protocols = ();
+
+        while (my $row = <$fh>) {
+          my @r = split (/\t| /, $row);
+          next if ($r[0] eq "#");
+          $protocols{$r[0]} = $r[1];
+        }
+
+        close($fh);
+
+        my $val = "";
+
+        # Format: ip_proto:[!|>|<] <name or number>;
+        $val = (split(/</, $add_data))[1] if ($add_data =~ /</);
+        $val = (split(/>/, $add_data))[1] if ($add_data =~ />/);
+        $val = (split(/!/, $add_data))[1] if ($add_data =~ /!/);
+
+        if ( $val !~ /^[0-9,.E]+$/ ) # NaN -> find protocol number
+        {
+          if (exists $protocols{$val})
+          {
+            $val = $protocols{$val};
+          }
+          else
+          {
+            print "[ERROR] Can't resolve protocol \"$val\"\n";
+            next;
+          }
+        }
+
+        # val now stores the protocol number
+        if ($add_data =~ /!/)
+        {
+          foreach my $p (values %protocols)
+          {
+            if ($p != $val)
+            {
+              $ip{ip}{protocol} = $p;
+              last;
+            }
+          }
+        }
+        elsif ($add_data =~ />/)
+        {
+          foreach my $p (values %protocols)
+          {
+            if ($p > $val)
+            {
+              $ip{ip}{protocol} = $p;
+              last;
+            }
+          }
+        }
+        elsif ($add_data =~ /</)
+        {
+          foreach my $p (values %protocols)
+          {
+            if ($p < $val)
+            {
+              $ip{ip}{protocol} = $p;
+              last;
+            }
+          }
+        }
+      }
       # ACKNOWLEDGEMENT (TCP)
       elsif ($key =~ /:ack/)
       {
