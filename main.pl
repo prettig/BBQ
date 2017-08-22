@@ -12,6 +12,7 @@ use Tk::JComboBox;
 use Net::RawIP;
 use NetAddr::IP;
 use Net::Pcap;
+use LWP::Simple;
 
 use URI::Normalize qw( normalize_uri );
 
@@ -360,42 +361,39 @@ else ################################################################# SENDER MO
     %additional_data = ();
     while (my $row = <$fh>) {
       my @all_elements = split / /, $row;
+         @all_elements = grep { $_ ne '' } @all_elements;
       if ($all_elements[0] eq '#' || substr($row, 0, 1) eq '#' || scalar(@all_elements) < 2){ next; } # skip comments
+      my $dontadd = 0;
+      my $dst = $all_elements[5];
+      if ($dst ne "any" && $dst !~ /\$/)
+      {
+        # Snort may not detect the packet if it's being sent to non-existent hosts,
+        # or if the TARGET_IP is not in the subnet of the destination.
+        $dst = (split(/\//, $dst))[0] if ($dst =~ /\//);
+        $dst =~ s/\[//g;
+        $dst = NetAddr::IP->new($dst);
+        my $tgt = NetAddr::IP->new($config{"TARGET_IP"});
+        if (!$tgt->within($dst))
+        {
+            # we don't just skip here, because data like flowbits should still be stored in the background
+            $dontadd = 1;
+        }
+      }
 
       my ($options) = $row =~ /\((.*?)\)/; # extract options part in brackets
       $options =~ s/\"//g;                 # remove " from string
       my @elements = split /;/, $options;
 
       my %optionlist = ();
-
-      # options can occur multiple of times, so we number the keys uniquely
-      my %counter = ();
-
+      my $counter = 0;
       foreach my $el (@elements)
       {
         my @expr = split /:/, $el;
         $expr[0] =~ s/^\s+//;
-
-        $counter{$expr[0]} = 0 if (!exists $counter{$expr[0]});
-        my $key = $expr[0].".".$counter{$expr[0]};
-
-        # assign these keywords to their respective content
-        if ($expr[0] eq "byte_test" || $expr[0] eq "offset")
-        {
-          # there mustve already been at least one content key
-          # prepend "y" to make sure this will be processed after content
-          $key = "y".$expr[0].".".($counter{"content"} - 1);
-        }
-        if ($expr[0] eq "distance")
-        {
-          # distance can depend on byte_test and offset, so it has to be processed later
-          $key = "z".$expr[0].".".($counter{"content"} - 1);
-        }
-        $counter{$expr[0]} ++;
-        $optionlist{$key} = $expr[1];
+        $optionlist{$counter .":". $expr[0]} = $expr[1];
+        $counter++;
       }
 
-      my $dontadd = 0;
       foreach my $k (keys %optionlist)
       {
         my $d = $optionlist{$k};
@@ -415,7 +413,7 @@ else ################################################################# SENDER MO
           }
         }
         # don't show the alert if it has unsupported keywords
-        if ($k =~ /pcre/)
+        if ($k =~ /pcre/ || $k =~/flowbits/)
         {
           $dontadd = 1;
         }
@@ -432,7 +430,14 @@ else ################################################################# SENDER MO
         $hlist->itemCreate($item_counter, 5, -text => $all_elements[4]);
         $hlist->itemCreate($item_counter, 6, -text => $all_elements[5]);
         $hlist->itemCreate($item_counter, 7, -text => $all_elements[6]);
-        $hlist->itemCreate($item_counter, 8, -text => "" . $optionlist{"msg.0"});
+        foreach my $k (keys %optionlist)
+        {
+          if ($k =~ /:msg/)
+          {
+            $hlist->itemCreate($item_counter, 8, -text => "" . $optionlist{$k});
+            last;
+          }
+        }
       }
       $additional_data{$item_counter} = \%optionlist;
 
@@ -566,54 +571,46 @@ else ################################################################# SENDER MO
       #$src_ip =  int(rand(256)) . "." . int(rand(256)) . "." . int(rand(256)) . "." . int(rand(256));
     }
 
-    if ($dst_ip ne "any")
-    {
-      # Snort may not detect the packet if it's being sent to non-existent hosts,
-      # or if the TARGET_IP is not in the subnet of the destination.
-      # Warn the user if that happens.
-      my $net = NetAddr::IP->new($dst_ip);
-      my $tgt = NetAddr::IP->new($config{"TARGET_IP"});
-      if (!$tgt->within($net))
-      {
-          $sb_label->configure(-text => "[WARNING] Rule #$id: TARGET_IP is not in subnet of destination.");
-      }
-    }
+    # Remove CIDR notation if existing
+    $src_ip = (split(/\//, $src_ip))[0] if ($src_ip =~ /\//);
+    $dst_ip = (split(/\//, $dst_ip))[0] if ($dst_ip =~ /\//);
+
     # Set the destination to TARGET_IP, which is no problem if the destination is "any".
     # Otherwise, the user has been warned.
     $dst_ip = $config{"TARGET_IP"};
 
     $src_port = int(rand(65535)) + 1 if ($src_port eq "any");
     $src_port =~ s/\:.*//;
-    #$src_port =~ s/\:.*//;
     print "srcport: $src_port\n";
+
     # Set destination port to COMM_PORT if we can, so we don't have to request
     # the receiver to bind a second port if a handshake was required
     $dst_port = COMM_PORT if ($dst_port eq "any");
     $dst_port =~ s/\:.*//;
-    print "dstport: $dst_port\n";
+    print "dst: $dst_ip:$dst_port\n";
 
     my %ip = ( ip => { saddr => $src_ip, daddr => $dst_ip } );
 
     my %proto = ();
-    if ($protocol ne "icmp")
-    {
-      %proto = ( source => "$src_port", dest => $dst_port, check => 0 );
-    }
+       %proto = ( source => $src_port, dest => $dst_port, check => 0 ) if ($protocol ne "icmp");
 
     my $ttl = 255;
     my $handshake = 0;
-    my @payload = ();
-    my @last_byte_test_offset = ();
+    my $payload = "";
     my $repeat = 1;
+    my $doe = 0;
+    my $length_last_content = 0;
+    my $is_uri = 0;
 
-    foreach my $key (sort keys %{ $additional_data{$id} })
+    foreach my $key ( sort { (split(/:/, $a))[0] <=> (split(/:/, $b))[0] } keys %{ $additional_data{$id} })
     {
+      print "PARSING $key #######################\n\n";
       my $add_data = $additional_data{$id}{$key};
 
       # CONTENT
-      if ($key =~ /^content/)
+      if ($key =~ /:content/)
       {
-        my $content = "";
+        $length_last_content = 0;
         print "got $key: $add_data\n";
         if ($add_data =~ /\|/)
         {
@@ -632,9 +629,19 @@ else ################################################################# SENDER MO
               my @ws = split(/ /, $s);
               foreach my $hex (@ws)
               {
-                print "hex $s to ".chr(hex $hex)."\n";
+                print "hex $s to \"".chr(hex $hex)."\"\n";
                 # Translate hex
-                $content .= chr(hex $hex);
+                my $new_str = chr(hex $hex);
+                if ($doe == length($payload))
+                {
+                  $payload .= $new_str;
+                }
+                else
+                {
+                  substr($payload, $doe, length($new_str), $new_str);
+                }
+                $length_last_content ++;
+                $doe ++;
               }
             }
             else
@@ -643,10 +650,21 @@ else ################################################################# SENDER MO
               foreach my $ascii (@ws)
               {
                 my $hex_string = unpack "H*", $ascii;
+                $hex_string = chr(hex $hex_string);
                 # Translate hex
-                $content .= chr(hex $hex_string);
+                if ($doe == length($payload))
+                {
+                  $payload .= $hex_string;
+                }
+                else
+                {
+                  substr($payload, $doe, length($hex_string), $hex_string);
+                }
+                $length_last_content ++;
+                $doe ++;
               }
-              print "Payload is now \"".$content."\"\n";
+
+              print "Payload is now \"".$payload."\"\n";
             }
             $is_hex = !$is_hex;
           }
@@ -661,60 +679,90 @@ else ################################################################# SENDER MO
           foreach my $ascii (@ws)
           {
             my $hex_string = unpack "H*", $ascii;
+               $hex_string = chr(hex $hex_string);
             # Translate hex
-            $content .= chr(hex $hex_string);
+            if ($doe == length($payload))
+            {
+              $payload .= $hex_string;
+            }
+            else
+            {
+              substr($payload, $doe, length($hex_string), $hex_string);
+            }
+            $length_last_content ++;
+            $doe ++;
           }
         }
-
-        push (@payload, $content);
+        print "end of content. DOE: $doe\n";
+          print "TCP payload: ".$payload."\n";
       }
-      elsif ($key =~ /^uricontent/)
+      elsif ($key =~ /:uricontent/)
       {
-        push (@payload, normalize_uri($add_data));
+        $payload .= normalize_uri($add_data);
+        $length_last_content = length(normalize_uri($add_data));
+        $doe .= $length_last_content;
+        $is_uri = 1;
       }
       elsif ($key =~ /offset/)
       {
-        print "offset?: $key\n";
+        print "offset key: $key\n";
         print "offset: $add_data\n";
-        my $payload_index = (split(/\./, $key))[1];
-        print "index = $payload_index\n";
-        print "detected offset for content: ".$payload[$payload_index]."\n";
-        my $pld = "";
-        for (my $i = 0; $i < $payload_index; $i++)
-        {
-          $pld .= $payload[$i];
-        }
+        print "payload: $payload\n";
+        print "doe: $doe\n";
 
-        my $diff = $add_data - length($pld);
-        print "diff: $diff\n";
-        $payload[$payload_index] = 'x' x $diff . $payload[$payload_index] if ($diff > 0);
-        print "new content: ".$payload[$payload_index]."\n";
+        if ($add_data < $doe) # content should be placed in earlier part of payload
+        {
+          my $last_content = substr($payload, $doe-$length_last_content, $length_last_content, "");
+          substr($payload, $add_data, $length_last_content, $last_content);
+        }
+        else
+        {
+          #if our content has byte_test data added, this counts aswell
+          my $diff = $add_data + $length_last_content - $doe;
+          print "diff: $diff\n";
+          substr($payload, $length_last_content, 0, 'x' x $diff) if ($diff > 0);
+          print "new content: $payload\n";
+        }
+        $doe = $add_data;
       }
       elsif ($key =~ /distance/)
       {
-        my $payload_index = (split(/\./, $key))[1];
-        my $off = 0;
-        print "LAST BYTE OFFSET:\n";
-        print "$payload_index: ".$last_byte_test_offset[$payload_index] ."\n";
-        if ($last_byte_test_offset[$payload_index])
+        print "DISTANCE\n";
+        print "payload: \"$payload\"\n";
+        print "doe: $doe\n";
+        print "length last content: $length_last_content\n";
+        my $last_content = substr($payload, $doe - $length_last_content, $length_last_content, "");
+        print "last content: \"$last_content\"\n";
+        if ($add_data > 0)
         {
-          $off = $last_byte_test_offset[$payload_index];
-          print "last bytetest offset was $off\n";
+          substr($payload, $doe - $length_last_content, $length_last_content + $add_data, 'x' x $add_data . $last_content);
         }
-        $payload[$payload_index] = 'x' x ($add_data - $off) . $payload[$payload_index];
+        else
+        {
+          substr($payload, $doe + $add_data - $length_last_content, $length_last_content, $last_content);
+        }
+        print "payload: \"$payload\"\n";
+        $doe += $add_data;
       }
       elsif ($key =~ /byte_test/)
       {
         print "Got byte_test\n";
-        my $payload_index = (split(/\./, $key))[1];
         my @btest = split(/,/, $add_data);
         my $bytes_to_convert = $btest[0];
         my $operator = $btest[1];
         my $value = $btest[2];
         my $offset = $btest[3];
 
+        if ($add_data =~ /relative/)
+        {
+          $doe += $offset;
+        }
+        else
+        {
+          $doe = $offset;
+        }
+
         # TODO: [,relative] [,<endian>] [,<number type>, string]
-      #  my $byte_test .= int($offset) x " ";
         my $fake;
         if ($operator =~ /=/)
         {
@@ -735,16 +783,62 @@ else ################################################################# SENDER MO
           $fake = "1";
         }
 
-        while (length($fake) < $bytes_to_convert)
+        if (length($payload) < $doe)
         {
-          $fake .= $fake;
+          my $diff = $doe - length($payload);
+          substr ($payload, $doe - $diff, 0, "x" x $diff);
         }
-        print "offset is: $offset\n";
-        $fake = "0" x $offset . $fake;
-        print "Fake is \"$fake\"\n";
-        print "Fake length \@$payload_index: ".length($fake)."\n";
-        $last_byte_test_offset[$payload_index+1] = length($fake);
-        $payload[$payload_index] .= $fake;
+
+        $fake = sprintf("%X", $fake) if ($add_data =~ /string/);
+        my $zeroes = $bytes_to_convert * 2 - length($fake);
+        $fake = "0" x $zeroes . $fake;
+
+        if ($add_data !~ /string/)
+        {
+          my @hex_fake = ( $fake =~ m/../g );
+          $fake = pack 'H2' x @hex_fake, @hex_fake;
+        }
+
+        substr ($payload, $doe, 0, $fake);
+        print "l_fake: ".length($fake)."\n";
+        $doe += length($fake);
+        print "new payload: $payload\n";
+        print "doe: $doe\n";
+      }
+      elsif ($key =~ /byte_jump/)
+      {
+        # byte_jump reads $byte_length bytes at $offset and jumps that far
+        print "Got $key\n";
+        my $byte_length = (split(/,/, $add_data))[0];
+        my $offset = (split(/,/, $add_data))[1];
+
+        if ($add_data =~ /relative/)
+        {
+          $doe += $offset;
+        }
+        else
+        {
+          $doe = $offset;
+        }
+
+        if (length($payload) < $doe)
+        {
+          my $diff = $doe - length($payload);
+          print "doe: $doe, len_payload: ".length($payload)." diff: $diff\n";
+          substr ($payload, $doe - $diff, 0, "x" x $diff);
+        }
+
+        # workaround: we jump 20 bytes which should be enough for most (or all) negative offsets to come
+        #             if for example the next byte_test has an offset of 0, this is a waste of space
+        my $jump = "\x00" x ($byte_length - 1) . "\x14";
+           $jump = "0" x ($byte_length - 1) . "20" if ($add_data !~ /string/);
+        substr ($payload, $doe, 0, $jump);
+        $doe += $byte_length;
+        print "filling 20bytes from $doe\n";
+        # now fill the bytes we skipped
+        substr ($payload, $doe, 0, "x" x 20);
+        $doe += 20;
+        print "new payload: $payload\n";
       }
       # TIME TO LIVE
       elsif ($key =~ /ttl/)
@@ -755,7 +849,7 @@ else ################################################################# SENDER MO
           # {<, >, >=, <=}ttl
           if ($& eq ">")
           {
-             $ttl = 255; # max value to make sure it arrives
+             $ttl = 255; # just go with max value
           }
           elsif ($& eq "<")
           {
@@ -787,18 +881,22 @@ else ################################################################# SENDER MO
           $proto{code} = $add_data;
         }
       }
-      elsif ($key =~ /^threshold/)
+      elsif ($key =~ /:threshold/)
       {
         # rules with the threshold keyword may either alert only after x matches,
         # or up until x matches. To trigger former rules, our packet has to be
         # sent multiple times.
+        # The documentation says this is tracked by unique ip, but starting
+        # seperate sessions works aswell. Otherwise this would be impossible
+        # in combination with the established keyword, as we can't spoof the
+        # TCP Handshake
         my @spl = split(/,/, $add_data);
         my $type = (split (/ /, $spl[0]))[1];
         my $count =  (split (/ /, $spl[2]))[1];
         $repeat = $count if ($type =~ /threshold/ || $type =~ /both/);
       }
       # ICMP TYPE
-      elsif ($key =~ /itype/)
+      elsif ($key =~ /:itype/)
       {
         if ($add_data =~ /<>/)
         {
@@ -821,7 +919,7 @@ else ################################################################# SENDER MO
         }
       }
       # TCP FLAGS
-      elsif ($key =~ /flags/)
+      elsif ($key =~ /:flags/)
       {
         # See http://manual-snort-org.s3-website-us-east-1.amazonaws.com/node33.html#SECTION00468000000000000000
         # Bit 1 = C (CWR) and 2 = E (ECE)
@@ -891,16 +989,53 @@ else ################################################################# SENDER MO
         $rawIP_tcp->set({ tcp => {res2 => $cwr_ece} });
       }
       # ACKNOWLEDGEMENT (TCP)
-      elsif ($key =~ /ack/)
+      elsif ($key =~ /:ack/)
       {
-        $rawIP_tcp->set({ tcp => {ack => $add_data} });
+        $rawIP_tcp->set({ tcp => {ack_seq => $add_data} });
+      }
+      # SEQUENCE NUMBER (TCP)
+      elsif ($key =~ /:seq/)
+      {
+        $rawIP_tcp->set({ tcp => {seq => $add_data} });
+      }
+      elsif ($key =~ /:dsize/)
+      {
+         if ($add_data =~ /<>/)
+         {
+           $payload .= "x" x (split(/<>/, $add_data))[1];
+         }
+         elsif ($add_data =~ /</)
+         {
+           $payload .= "x" x ((split(/</, $add_data))[1] - 1);
+         }
+         elsif ($add_data =~ />/)
+         {
+           $payload .= "x" x ((split(/>/, $add_data))[1] + 1);
+         }
+      }
+      elsif ($key =~ /:window/)
+      {
+          my $win = $add_data;
+          if ($add_data =~ /!/)
+          {
+            $win = (split (/!/, $add_data))[1];
+            if ($win == "20")
+            {
+              $win = 10;
+            }
+            else
+            {
+              $win = 20;
+            }
+          }
+          $rawIP_tcp->set({ tcp => {window => $win} });
       }
       # FLOW
       # flow:[(established|not_established|stateless)]
       #      [,(to_client|to_server|from_client|from_server)]
       #      [,(no_stream|only_stream)]
       #      [,(no_frag|only_frag)];
-      elsif ($key =~ /flow\./)
+      elsif ($key =~ /:flow$/)
       {
         print "flowdata: $add_data\n";
         if ($add_data =~ /established/) # equal to flag "+A"
@@ -914,7 +1049,7 @@ else ################################################################# SENDER MO
           $from_server = 1;
         }
       }
-      elsif ($key =~ /flowbits/)
+      elsif ($key =~ /:flowbits$/)
       {
         print "Rule has flowbits.\n";
         if ($add_data =~ /isset/)
@@ -929,7 +1064,7 @@ else ################################################################# SENDER MO
         }
       }
       # MESSAGE
-      elsif ($key =~ /msg/)
+      elsif ($key =~ /:msg/)
       {
         # irrelevant to payload
         next;
@@ -940,18 +1075,27 @@ else ################################################################# SENDER MO
       }
     }
 
-    $proto{data} = join("", @payload);
+    $proto{data} = $payload;
 
     for (my $i = 0; $i < $repeat; $i++)
     {
       if ($protocol eq "tcp" || $protocol eq "ip")
       {
+          if ($is_uri)
+          {
+            # for this to work, a webserver like apache2 must be running on the target system
+            # we shortcut creating a http request ourselves by just using the built in module
+            my $request = "http://".$config{"TARGET_IP"}.$payload;
+            get $request;
+            next;
+          }
+
           $rawIP_tcp->set({
             %ip,
             tcp => { %proto }
           });
 
-          print "Target port is: ".$ip{ip}{saddr}.":".$proto{source}."\n";
+          print "Target is: ".$ip{ip}{saddr}.":".$proto{source}."\n";
           if (!$handshake && !$from_server)
           {
             $rawIP_tcp->send;
@@ -1224,6 +1368,7 @@ else ################################################################# SENDER MO
       print "Sequence Number: ".$synack->{seqnum}."\n";
       print "Arrived at ".$sa_ip->{dest_ip}.":". $synack->{dest_port}."\n";
       print "Target: ".$sa_ip->{src_ip}.":".$synack->{src_port}."\n";
+      print "Payload: $user_data\n";
 
       my $n = Net::RawIP->new({
          ip  => {
