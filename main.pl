@@ -1025,7 +1025,7 @@ else ################################################################# SENDER MO
 
         close($fh);
 
-        my $val = "";
+        my $val = $add_data;
 
         # Format: ip_proto:[!|>|<] <name or number>;
         $val = (split(/</, $add_data))[1] if ($add_data =~ /</);
@@ -1078,6 +1078,10 @@ else ################################################################# SENDER MO
               last;
             }
           }
+        }
+        else
+        {
+          $ip{ip}{protocol} = $val;
         }
       }
       # ACKNOWLEDGEMENT (TCP)
