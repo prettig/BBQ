@@ -13,6 +13,8 @@ use Net::RawIP;
 use NetAddr::IP;
 use Net::Pcap;
 use LWP::Simple;
+use MIME::Base64 qw( encode_base64 decode_base64 );
+
 
 use URI::Normalize qw( normalize_uri );
 
@@ -23,10 +25,6 @@ use Net::PcapUtils;
 use NetPacket::Ethernet qw(:strip);
 use NetPacket::IP qw(:strip);
 use NetPacket::TCP;
-
-use POSIX qw(strftime);
-use Time::HiRes qw(gettimeofday);
-use Time::Piece;
 
 use constant COMM_PORT => 7777;
 
@@ -90,54 +88,60 @@ if ($comm eq "-r")
       my $client_port = $client_socket->peerport();
       print "connection from $client_address:$client_port\n";
 
-      my $data = "";
-      my $data2;
-      $client_socket->recv($data, 1024);
-      if ($data =~ /;/) # two requests
-      {
-        my @d = split(/;/, $data);
-        $data = $d[0];
-        $data2 = $d[1];
-      }
-      if ( $data =~ /^[0-9,.E]+$/ ) # check if number
-      {
-        print "received request to bind port $data\n";
-        print `/etc/init.d/apache2 stop` if ($data eq "80");
+      # request format: [payload:<payload>;][ip:<ip>;][port:<port>;]
+      my $request = "";
+      $client_socket->recv($request, 1024);
 
+      my $port = COMM_PORT;
+      my $ip = $config{"TARGET_IP"};
+      my $payload = "";
+
+      my @d = split(/;/, $request);
+      foreach my $el (@d)
+      {
+        my @spl = split(/:/, $el);
+        my $key = $spl[0];
+        my $data = $spl[1];
+
+        $port = $data if ($key eq "port");
+        $ip = $data if ($key eq "ip");
+        $payload = decode_base64($data) if ($key eq "payload");
+      }
+
+      print "received request \"$request\"\n";
+      print `/etc/init.d/apache2 stop` if ($port eq "80");
+
+      if ($ip ne $config{"TARGET_IP"} || $port ne COMM_PORT)
+      {
         my $tmp_socket = new IO::Socket::INET (
-            LocalHost => $config{"TARGET_IP"},
-            LocalPort => $data,
+            LocalHost => $ip,
+            LocalPort => $port,
             Proto => 'tcp',
             Listen => 5,
             Reuse => 1
         );
         die "cannot create socket $!\n" unless $tmp_socket;
-        print "port $data is open, waiting for client.\n";
+
+        print "port $port is open, waiting for client.\n";
 
         $client_socket->send("OK"); # let sender know the port is open, or send payload
         shutdown($tmp_socket, 1);
 
         my $tmp_client = $tmp_socket->accept();
-        $tmp_client->send($data2) if ($data2);
+           $tmp_client->send($payload) if ($payload ne "");
 
         # handshake is done -> close socket
-        print "Handshake complete, closing port $data.\n";
+        print "Handshake complete, closing port $port.\n";
         shutdown($tmp_client, 1);
         $tmp_socket->close();
-        print `/etc/init.d/apache2 start` if ($data eq "80");
+
+        print `/etc/init.d/apache2 start` if ($port eq "80");
       }
-      elsif ( $data =~ /from_server/)
+      elsif ($payload ne "")
       {
-        my @spl = split(/:/, $data);
-        print "received FROM_SERVER request: \"$data\". Sending \"".$spl[1]."\" back.\n";
-        $client_socket->send($spl[1]);
+        $client_socket->send($payload);
       }
-      else
-      {
-        $client_socket->send("0"); # receiver interprets this as error
-        print "received incorrect data: $data\n";
-        shutdown($client_socket, 1);
-      }
+      shutdown($client_socket, 1);
   }
 
   $socket->close();
@@ -318,6 +322,7 @@ else ################################################################# SENDER MO
     $config{"FILE_DATA_PORTS"} = $config_file{"FILE_DATA_PORTS"};
     $config{"GTP_PORTS"}       = $config_file{"GTP_PORTS"};
     $config{"AIM_SERVERS"}     = $config_file{"AIM_SERVERS"};
+    print "Config loaded.\n";
   }
 
   sub write_config()
@@ -368,15 +373,41 @@ else ################################################################# SENDER MO
       if ($all_elements[0] eq '#' || substr($row, 0, 1) eq '#' || scalar(@all_elements) < 2){ next; } # skip comments
       my $dontadd = 0;
       my $dst = $all_elements[5];
-      if ($dst ne "any" && $dst !~ /\$/)
+
+      my $neg = 1 if ($dst =~ /!/);
+      if ($dst =~ /\$/)
       {
-        # Snort may not detect the packet if it's being sent to non-existent hosts,
-        # or if the TARGET_IP is not in the subnet of the destination.
+        $dst =~ s/\$//g;
+        $dst =~ s/!//g;
+        if (exists $config{"$dst"})
+        {
+          $dst = $config{"$dst"};
+        }
+        else
+        {
+          print "[ERROR] Can't resolve \"$dst\"\n";
+        }
+      }
+
+      if ($dst eq "any" && $neg)
+      {
+        # cant fulfill target "not any"
+        $dontadd = 1;
+      }
+      elsif (ref($dst) eq 'ARRAY')
+      {
+        $dontadd = 1;
+        foreach my $item (@{$dst})
+        {
+          $dontadd = 0 if ($item eq $config{"TARGET_IP"});
+        }
+      }
+      elsif ($dst ne "any")
+      {
         $dst = (split(/\//, $dst))[0] if ($dst =~ /\//);
         $dst =~ s/\[//g;
-        $dst = NetAddr::IP->new($dst);
-        my $tgt = NetAddr::IP->new($config{"TARGET_IP"});
-        if (!$tgt->within($dst))
+
+        if ($dst ne $config{"TARGET_IP"})
         {
             # we don't just skip here, because data like flowbits should still be stored in the background
             $dontadd = 1;
@@ -578,6 +609,8 @@ else ################################################################# SENDER MO
     $src_ip = (split(/\//, $src_ip))[0] if ($src_ip =~ /\//);
     $dst_ip = (split(/\//, $dst_ip))[0] if ($dst_ip =~ /\//);
 
+    print "SRC IP: $src_ip\n";
+
     # Set the destination to TARGET_IP, which is no problem if the destination is "any".
     # Otherwise, the user has been warned.
     $dst_ip = $config{"TARGET_IP"};
@@ -717,10 +750,10 @@ else ################################################################# SENDER MO
         }
         else
         {
-          #if our content has byte_test data added, this counts aswell
+          # if our content has byte_test data added, this counts aswell
           my $diff = $add_data + $length_last_content - $doe;
           print "diff: $diff\n";
-          substr($payload, $length_last_content, 0, 'x' x $diff) if ($diff > 0);
+          substr($payload, $doe - $length_last_content, 0, 'x' x $diff) if ($diff > 0);
           print "new content: $payload\n";
         }
         $doe = $add_data + $length_last_content;
@@ -1414,19 +1447,15 @@ else ################################################################# SENDER MO
     my $src_port = $tcpinfos{source};
     my $dst_port = $tcpinfos{dest};
 
-    if ($from_server)
-    {
-      # switch source and dest ports
-      my $tmp = $src_port;
-      $src_port = $dst_port;
-      $dst_port = $tmp;
-    }
+    # switch source and dest ports
+    ($src_port, $dst_port) = ($dst_port, $src_port) if ($from_server);
 
-    if ($dst_port ne "".COMM_PORT)
+    if ($dst_port ne "".COMM_PORT || $from_server)
     {
-      my $val = $dst_port;
-      $val .= ";".$tcpinfos{data} if ($from_server);
-      request_open_port($val);
+      my $val;
+         $val .= "port:$dst_port;" if ($dst_port ne "".COMM_PORT);
+         $val .= "payload:".$tcpinfos{data}.";" if ($from_server);
+      send_request($val);
     }
 
     my $err = '';
@@ -1489,10 +1518,10 @@ else ################################################################# SENDER MO
     }
   }
 
-  sub request_open_port
+  sub send_request
   {
-    my $port = shift;
-    my $payload = shift;
+    # request format: [payload:<payload>;][ip:<ip>;][port:<port>;]
+    my $request = shift;
 
     my $socket = new IO::Socket::INET (
       PeerHost => $config{"TARGET_IP"},
@@ -1502,9 +1531,16 @@ else ################################################################# SENDER MO
     die "cannot connect to the server $!\n" unless $socket;
     print "connected to the server\n";
 
-    $port = "$port;$payload" if ($payload);
-    print "sent port request $port\n";
-    $socket->send($port); # send request to open port and payload if given
+    print "sent request $request\n";
+
+    if ($request =~ /payload:(.*?);/)
+    {
+      my $payload = encode_base64($1);
+      print "Encoded Payload: $payload\n";
+      $request =~ s/$1/$payload/g;
+    }
+
+    $socket->send($request); # send request to open port and payload if given
     shutdown($socket, 1);
 
     my $response = "";
