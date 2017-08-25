@@ -451,7 +451,7 @@ else ################################################################# SENDER MO
       }
 
       my ($options) = $row =~ /\((.*?)\)/; # extract options part in brackets
-      $options =~ s/\"//g;                 # remove " from string
+    #  $options =~ s/\"//g;                 # remove " from string
       my @elements = split /;/, $options;
 
       my %optionlist = ();
@@ -504,7 +504,8 @@ else ################################################################# SENDER MO
         {
           if ($k =~ /:msg/)
           {
-            $hlist->itemCreate($item_counter, 8, -text => "" . $optionlist{$k});
+            $optionlist{$k} =~ s/\"//g; # remove " from string
+            $hlist->itemCreate($item_counter, 8, -text => $optionlist{$k});
             last;
           }
         }
@@ -659,6 +660,10 @@ else ################################################################# SENDER MO
     # the receiver to bind a second port if a handshake was required
     $dst_port = COMM_PORT if ($dst_port eq "any");
     $dst_port =~ s/\:.*//;
+    if ($dst_port =~ /!/)
+    {
+      $dst_port = (split(/!/, $dst_port))[1] - 1;
+    }
     print "dst: $dst_ip:$dst_port\n";
 
     my %ip = ( ip => { saddr => $src_ip, daddr => $dst_ip } );
@@ -682,6 +687,9 @@ else ################################################################# SENDER MO
       # CONTENT
       if ($key =~ /:content/)
       {
+        my $neg = (split(/\"/, $add_data))[0] eq "!";
+
+        $add_data =~ s/\"//g;
         $length_last_content = 0;
         print "got $key: $add_data\n";
         if ($add_data =~ /\|/)
@@ -704,6 +712,17 @@ else ################################################################# SENDER MO
                 print "hex $s to \"".chr(hex $hex)."\"\n";
                 # Translate hex
                 my $new_str = chr(hex $hex);
+                if ($neg)
+                {
+                  if ($new_str ne "x")
+                  {
+                    $new_str = "x";
+                  }
+                  else
+                  {
+                    $new_str = "y";
+                  }
+                }
                 if ($doe == length($payload))
                 {
                   $payload .= $new_str;
@@ -724,6 +743,19 @@ else ################################################################# SENDER MO
                 my $hex_string = unpack "H*", $ascii;
                 $hex_string = chr(hex $hex_string);
                 # Translate hex
+
+                if ($neg)
+                {
+                  if ($hex_string ne "x")
+                  {
+                    $hex_string = "x";
+                  }
+                  else
+                  {
+                    $hex_string = "y";
+                  }
+                }
+
                 if ($doe == length($payload))
                 {
                   $payload .= $hex_string;
@@ -750,6 +782,19 @@ else ################################################################# SENDER MO
             my $hex_string = unpack "H*", $ascii;
                $hex_string = chr(hex $hex_string);
             # Translate hex
+
+            if ($neg)
+            {
+              if ($hex_string ne "x")
+              {
+                $hex_string = "x";
+              }
+              else
+              {
+                $hex_string = "y";
+              }
+            }
+
             if ($doe == length($payload))
             {
               $payload .= $hex_string;
@@ -960,9 +1005,15 @@ else ################################################################# SENDER MO
         # in combination with the established keyword, as we can't spoof the
         # TCP Handshake
         my @spl = split(/,/, $add_data);
+        for (my $i; $i < scalar(@spl); $i++)
+        {
+          $spl[$i] =~ s/^ *//g;
+        }
         my $type = (split (/ /, $spl[0]))[1];
         my $count =  (split (/ /, $spl[2]))[1];
+        print "count: $count\n";
         $repeat = $count if ($type =~ /threshold/ || $type =~ /both/);
+        print "threshold repetition: $repeat\n";
       }
       # ICMP TYPE
       elsif ($key =~ /:itype/)
@@ -1500,7 +1551,7 @@ else ################################################################# SENDER MO
     die "cannot connect to portmapper $!\n" unless $socket;
     print "connected to portmapper\n";
 
-    if (!$from_server && $established) 
+    if (!$from_server && $established)
     {
       $socket->send("open:".$dst_port) if ($dst_port ne COMM_PORT);
 
