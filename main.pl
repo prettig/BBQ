@@ -27,6 +27,7 @@ use NetPacket::IP qw(:strip);
 use NetPacket::TCP;
 
 use constant COMM_PORT => 7777;
+my $local_ip = "169.254.222.155"; # TODO: GET LOCAL IP FROM SOCKET
 
 my $comm = $ARGV[0];
 
@@ -78,6 +79,9 @@ if ($comm eq "-r")
   die "cannot create socket $!\n" unless $socket;
   print "server waiting for client connection at ".$config{"TARGET_IP"}.":".COMM_PORT."\n";
   my $fi = " ";
+
+  my $socket2;
+
   while(1)
   {
       # wait for new client connection
@@ -88,62 +92,94 @@ if ($comm eq "-r")
       my $client_port = $client_socket->peerport();
       print "connection from $client_address:$client_port\n";
 
-      # request format: [payload:<payload>;][ip:<ip>;][port:<port>;]
+      # request format: [payload:<payload>;][saddr:<saddr>;][sport:<src_port>;]
       my $request = "";
       $client_socket->recv($request, 1024);
 
-      my $port = COMM_PORT;
-      my $ip = $config{"TARGET_IP"};
-      my $payload = "";
-
-      my @d = split(/;/, $request);
-      foreach my $el (@d)
+      if ($request =~ /^open:/)
       {
-        my @spl = split(/:/, $el);
-        my $key = $spl[0];
-        my $data = $spl[1];
-
-        $port = $data if ($key eq "port");
-        $ip = $data if ($key eq "ip");
-        $payload = decode_base64($data) if ($key eq "payload");
-      }
-
-      print "received request \"$request\"\n";
-      print `/etc/init.d/apache2 stop` if ($port eq "80");
-
-      if ($ip ne $config{"TARGET_IP"} || $port ne COMM_PORT)
-      {
-        my $tmp_socket = new IO::Socket::INET (
-            LocalHost => $ip,
+        my $port = (split(/:/, $request))[1];
+        print `/etc/init.d/apache2 stop` if ($port == 80);;
+        print "[WARNING] Received new 'open' request, but old socket has not been closed.\n" if ($socket2);
+        $socket2->close if ($socket2);
+        $socket2 = new IO::Socket::INET (
+            LocalHost => $config{"TARGET_IP"},
             LocalPort => $port,
             Proto => 'tcp',
             Listen => 5,
             Reuse => 1
         );
-        die "cannot create socket $!\n" unless $tmp_socket;
-
-        print "port $port is open, waiting for client.\n";
-
-        $client_socket->send("OK"); # let sender know the port is open, or send payload
-        shutdown($tmp_socket, 1);
-
-        my $tmp_client = $tmp_socket->accept();
-           $tmp_client->send($payload) if ($payload ne "");
-
-        # handshake is done -> close socket
-        print "Handshake complete, closing port $port.\n";
-        shutdown($tmp_client, 1);
-        $tmp_socket->close();
-
-        print `/etc/init.d/apache2 start` if ($port eq "80");
+        die "cannot create socket $!\n" unless $socket;
+        print "opened socket on port $port\n";
       }
-      elsif ($payload ne "")
+      elsif ($request =~/^close$/)
       {
-        $client_socket->send($payload);
+        print `/etc/init.d/apache2 start`;
+        $socket2->close if ($socket2);
+        undef $socket2;
       }
-      shutdown($client_socket, 1);
-  }
+      elsif ($request =~ /^send_raw:/)
+      {
+        my @data = split(/,/,(split(/:/, $request))[1]);
+        my $src_ip = $data[0];
+        my $src_port = $data[1];
+        my $dst_ip = $data[2];
+        my $dst_port = $data[3];
+        my $payload = decode_base64($data[4]);
 
+        my $n = Net::RawIP->new({
+            ip  => {
+                    saddr => $src_ip,
+                    daddr => $dst_ip,
+                   },
+            tcp => {
+                    source => $src_port,
+                    dest   => $dst_port,
+                    data   => $payload
+                   },
+        });
+        $n->send;
+      }
+      elsif ($request =~ /^send:/)
+      {
+        my @data = split(/,/,(split(/:/, $request))[1]);
+        my $src_port = $data[0];
+        my $payload = decode_base64($data[1]);
+        print `/etc/init.d/apache2 stop` if ($src_port == 80);
+
+        if ($src_port ne COMM_PORT)
+        {
+          $socket2->close if ($socket2);
+
+          $socket2 = new IO::Socket::INET (
+              LocalHost => $config{"TARGET_IP"},
+              LocalPort => $src_port,
+              Proto => 'tcp',
+              Listen => 5,
+              Reuse => 1
+          );
+          die "cannot create socket $!\n" unless $socket;
+          print "opened socket on port $src_port\n";
+        }
+
+        $client_socket->send("OK");
+        my $sock = $socket;
+           $sock = $socket2 if ($socket2);
+        my $client_socket2 = $sock->accept();
+        my $client_address = $client_socket2->peerhost();
+        my $client_port = $client_socket2->peerport();
+        print "connection from $client_address:$client_port\n";
+        $client_socket2->send($payload);
+        $client_socket2->close();
+        if ($src_port ne COMM_PORT && $socket2)
+        {
+          close $socket2;
+          undef $socket2;
+        }
+        print `/etc/init.d/apache2 start` if ($src_port == 80);
+      }
+  }
+  $socket2->close if($socket2);
   $socket->close();
   print "exit.";
   exit(0);
@@ -599,11 +635,7 @@ else ################################################################# SENDER MO
 
     my $from_server = 0;
 
-    if ($src_ip eq "any")
-    {
-      $src_ip = "169.254.222.155"; # TODO: GET LOCAL IP FROM SOCKET
-      #$src_ip =  int(rand(256)) . "." . int(rand(256)) . "." . int(rand(256)) . "." . int(rand(256));
-    }
+    $src_ip = $local_ip if ($src_ip eq "any");
 
     # Remove CIDR notation if existing
     $src_ip = (split(/\//, $src_ip))[0] if ($src_ip =~ /\//);
@@ -615,8 +647,12 @@ else ################################################################# SENDER MO
     # Otherwise, the user has been warned.
     $dst_ip = $config{"TARGET_IP"};
 
-    $src_port = int(rand(65535)) + 1 if ($src_port eq "any");
+    $src_port = COMM_PORT if ($src_port eq "any");
     $src_port =~ s/\:.*//;
+    if ($src_port =~ /!/)
+    {
+      $src_port = (split(/!/, $src_port))[1] - 1;
+    }
     print "srcport: $src_port\n";
 
     # Set destination port to COMM_PORT if we can, so we don't have to request
@@ -1175,6 +1211,7 @@ else ################################################################# SENDER MO
           # A TCP Hanshake is mandatory for this rule to trigger
           # set the handshake flag for this to be handled before the packet is sent
           $handshake = 1;
+          $from_server = 0;
         }
         if ($add_data =~ /from_server/ || $add_data =~ /to_client/)
         {
@@ -1236,7 +1273,7 @@ else ################################################################# SENDER MO
           else
           {
             print "Requiring handshake.\n";
-            tcp_handshake($rawIP_tcp, $from_server);
+            send_request($rawIP_tcp, $from_server, $handshake);
           }
       }
       elsif ($protocol eq "udp")
@@ -1433,58 +1470,96 @@ else ################################################################# SENDER MO
     );
   }
 
-  sub tcp_handshake
+  my $tmp_socket;
+  sub send_request
   {
     my $raw_tcp = shift;
     my $from_server = shift;
+    my $established = shift;
 
-    my %ipinfos = %{$raw_tcp->get({ip => [qw(saddr)]})};
+    my %ipinfos = %{$raw_tcp->get({ip => [qw(saddr daddr)]})};
     my %tcpinfos = %{$raw_tcp->get({tcp => [qw(source dest data)]})};
 
-    my $src_host = inet_ntoa(pack("N",shift||$ipinfos{saddr}));
-       $src_host = (gethostbyname($src_host))[4];
-
+    my $src_host = join '.', unpack 'C4', pack 'N', $ipinfos{saddr};
     my $src_port = $tcpinfos{source};
+
+    my $dst_host = join '.', unpack 'C4', pack 'N', $ipinfos{daddr};
     my $dst_port = $tcpinfos{dest};
 
-    # switch source and dest ports
-    ($src_port, $dst_port) = ($dst_port, $src_port) if ($from_server);
+    my $payload = $tcpinfos{data};
+    print "payload: $payload\n";
 
-    if ($dst_port ne "".COMM_PORT || $from_server)
+    print "saddr: $src_host\n";
+    print "daddr: $dst_host\n";
+
+    my $socket = new IO::Socket::INET (
+      PeerHost => $config{"TARGET_IP"},
+      PeerPort => COMM_PORT,
+      Proto => 'tcp',
+    );
+    die "cannot connect to portmapper $!\n" unless $socket;
+    print "connected to portmapper\n";
+
+    if (!$from_server && $established) 
     {
-      my $val;
-         $val .= "port:$dst_port;" if ($dst_port ne "".COMM_PORT);
-         $val .= "payload:".$tcpinfos{data}.";" if ($from_server);
-      send_request($val);
-    }
+      $socket->send("open:".$dst_port) if ($dst_port ne COMM_PORT);
 
-    my $err = '';
-    $pcap = pcap_open_live("eth0", 1024, 0, 0, \$err)
-            or die "Can't open device eth0: $err\n";
+      my $err = '';
+      $pcap = pcap_open_live("eth0", 1024, 0, 0, \$err)
+        or die "Can't open device eth0: $err\n";
 
-    # Destination address has to be TARGET_IP, or handshake won't work
-    my $dst_host = $config{"TARGET_IP"};
-       $dst_host = (gethostbyname($dst_host))[4];
+      my ($sock);
+      socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
+      bind($sock, pack_sockaddr_in($src_port, (gethostbyname($src_host))[4]));
+      my $paddr = sockaddr_in($dst_port, (gethostbyname($dst_host))[4]);
+      connect($sock, $paddr) or die "connection failed: $!";
 
-    my ($sock);
-    socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
-    bind($sock, pack_sockaddr_in($src_port, $src_host));
-    my $paddr = sockaddr_in($dst_port, $dst_host);
-    connect($sock, $paddr) or die "connection failed: $!";
-
-    if (!$from_server)
-    {
-      pcap_loop($pcap, -1, \&process_packet, $tcpinfos{data});
+      pcap_loop($pcap, -1, \&process_packet, \%tcpinfos);
       pcap_close($pcap);
+
+      $socket->send("close") if ($dst_port ne COMM_PORT);
     }
+    elsif ($from_server && !$established)
+    {
+      my ($sock);
+      if ($dst_port ne "7777")
+      {
+        socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
+        bind($sock, pack_sockaddr_in($dst_port, (gethostbyname($local_ip))[4]));
+      }
+      $socket->send("send_raw:$src_host,$src_port,$local_ip,$dst_port,".encode_base64($payload, ''));
+      close ($sock) if ($dst_port ne "7777" && $sock);
+    }
+    elsif ($from_server && $established)
+    {
+      print "send:$src_port,$payload\n";
+      $socket->send("send:$src_port,".encode_base64($payload, ''));
+      my ($sock);
+      socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
+      bind($sock, pack_sockaddr_in($dst_port, (gethostbyname($local_ip))[4]));
+      my $resp = "";
+      $socket->recv($resp, 1024); # wait for server to open socket
+      print "response: $resp\n";
+      if ($resp eq "OK")
+      {
+        my $paddr = sockaddr_in($src_port, (gethostbyname($dst_host))[4]);
+        print "trying to connect to $dst_host:$src_port... ";
+        connect($sock, $paddr) or die "connection failed: $!";
+        print "OK\n";
+      }
+      close($sock);
 
-    $sock->close();
+    }
+    # !$from_server && !$established won't end up in this subroutine
 
+    $socket->close;
   }
 
   sub process_packet
   {
     my ($user_data, $header, $packet) = @_;
+    my $payload = %{$user_data}{data};
+
     # Note: we should probably make sure that the syn-ack is actually sent from our target
     my $synack_eth 	= NetPacket::Ethernet->decode($packet);
     my $sa_ip  	= NetPacket::IP->decode($synack_eth->{data});
@@ -1495,8 +1570,8 @@ else ################################################################# SENDER MO
       print "Got SYN-ACK from ". $sa_ip->{src_ip}."\n";
       print "Sequence Number: ".$synack->{seqnum}."\n";
       print "Arrived at ".$sa_ip->{dest_ip}.":". $synack->{dest_port}."\n";
-      print "Target: ".$sa_ip->{src_ip}.":".$synack->{src_port}."\n";
-      print "Payload: $user_data\n";
+      print "Target: ".$sa_ip->{src_ip}.":".%{$user_data}{dest}."\n";
+      print "Payload: $payload\n";
 
       my $n = Net::RawIP->new({
          ip  => {
@@ -1504,49 +1579,17 @@ else ################################################################# SENDER MO
                  daddr => $sa_ip->{src_ip},
                 },
          tcp => {
-                 source  => $synack->{dest_port},
-                 dest    => $synack->{src_port},
+                 source  => %{$user_data}{source}."",
+                 dest    => %{$user_data}{dest}."",
                  ack     => 1,
                  seq     => $synack->{acknum},
                  ack_seq => $synack->{seqnum} + 1,
-                 data    => $user_data
+                 data    => $payload
                 },
         });
       $n->send;
-      print "Sent ACK with data: \"$user_data\"\n";
+      print "Sent ACK with data: \"$payload\"\n";
       pcap_breakloop($pcap);
     }
-  }
-
-  sub send_request
-  {
-    # request format: [payload:<payload>;][ip:<ip>;][port:<port>;]
-    my $request = shift;
-
-    my $socket = new IO::Socket::INET (
-      PeerHost => $config{"TARGET_IP"},
-      PeerPort => COMM_PORT,
-      Proto => 'tcp',
-    );
-    die "cannot connect to the server $!\n" unless $socket;
-    print "connected to the server\n";
-
-    print "sent request $request\n";
-
-    if ($request =~ /payload:(.*?);/)
-    {
-      my $payload = encode_base64($1);
-      print "Encoded Payload: $payload\n";
-      $request =~ s/$1/$payload/g;
-    }
-
-    $socket->send($request); # send request to open port and payload if given
-    shutdown($socket, 1);
-
-    my $response = "";
-    $socket->recv($response, 1024);
-    print "Requested open port: $response\n";
-
-    $socket->close();
   }
 }
