@@ -1,4 +1,10 @@
 #!perl
+
+# partially working: uricontent (some weird urls and hex chars not working)
+# experimental: distance, byte_test, byte_jump, offset
+# not working: flowbits
+# implementation not planned: pcre
+
 use strict;
 use warnings;
 use Config::Simple;
@@ -14,7 +20,8 @@ use NetAddr::IP;
 use Net::Pcap;
 use LWP::Simple;
 use MIME::Base64 qw( encode_base64 decode_base64 );
-
+use HTTP::Daemon;
+use HTTP::Client;
 
 use URI::Normalize qw( normalize_uri );
 
@@ -64,7 +71,6 @@ read_config();
 if ($comm eq "-r")
 {
   print "Running in receiver mode.\n";
-  print `/etc/init.d/apache2 start`;
   # auto-flush on socket
   $| = 1;
 
@@ -98,25 +104,29 @@ if ($comm eq "-r")
 
       if ($request =~ /^open:/)
       {
-        my $port = (split(/:/, $request))[1];
-        print `/etc/init.d/apache2 stop` if ($port == 80);;
-        print "[WARNING] Received new 'open' request, but old socket has not been closed.\n" if ($socket2);
-        $socket2->close if ($socket2);
-        $socket2 = new IO::Socket::INET (
-            LocalHost => $config{"TARGET_IP"},
-            LocalPort => $port,
-            Proto => 'tcp',
-            Listen => 5,
-            Reuse => 1
-        );
-        die "cannot create socket $!\n" unless $socket;
-        print "opened socket on port $port\n";
-      }
-      elsif ($request =~/^close$/)
-      {
-        print `/etc/init.d/apache2 start`;
+        my $req =  (split(/:/, $request))[1];
+        my $port = (split(/;/, $req))[0];
         $socket2->close if ($socket2);
         undef $socket2;
+        if ($request =~ /is_http/)
+        {
+          $socket2 = HTTP::Daemon->new(LocalAddr => $ARGV[0],
+                          LocalPort => $port,
+                          Listen => 20) || die;
+        }
+        else
+        {
+          $socket2 = new IO::Socket::INET (
+              LocalHost => $config{"TARGET_IP"},
+              LocalPort => $port,
+              Proto => 'tcp',
+              Listen => 5,
+              Reuse => 1
+          );
+          die "cannot create socket $!\n" unless $socket;
+        }
+
+        print "opened socket on port $port\n";
       }
       elsif ($request =~ /^send_raw:/)
       {
@@ -145,7 +155,6 @@ if ($comm eq "-r")
         my @data = split(/,/,(split(/:/, $request))[1]);
         my $src_port = $data[0];
         my $payload = decode_base64($data[1]);
-        print `/etc/init.d/apache2 stop` if ($src_port == 80);
 
         if ($src_port ne COMM_PORT)
         {
@@ -170,13 +179,13 @@ if ($comm eq "-r")
         my $client_port = $client_socket2->peerport();
         print "connection from $client_address:$client_port\n";
         $client_socket2->send($payload);
+        print "sent payload \"$payload\" back.\n";
         $client_socket2->close();
         if ($src_port ne COMM_PORT && $socket2)
         {
           close $socket2;
           undef $socket2;
         }
-        print `/etc/init.d/apache2 start` if ($src_port == 80);
       }
   }
   $socket2->close if($socket2);
@@ -409,6 +418,7 @@ else ################################################################# SENDER MO
       if ($all_elements[0] eq '#' || substr($row, 0, 1) eq '#' || scalar(@all_elements) < 2){ next; } # skip comments
       my $dontadd = 0;
       my $dst = $all_elements[5];
+      my $src = $all_elements[2];
 
       my $neg = 1 if ($dst =~ /!/);
       if ($dst =~ /\$/)
@@ -418,6 +428,19 @@ else ################################################################# SENDER MO
         if (exists $config{"$dst"})
         {
           $dst = $config{"$dst"};
+        }
+        else
+        {
+          print "[ERROR] Can't resolve \"$dst\"\n";
+        }
+      }
+      if ($src =~ /\$/)
+      {
+        $src =~ s/\$//g;
+        $src =~ s/!//g;
+        if (exists $config{"$src"})
+        {
+          $src = $config{"$src"};
         }
         else
         {
@@ -444,6 +467,31 @@ else ################################################################# SENDER MO
         $dst =~ s/\[//g;
 
         if ($dst ne $config{"TARGET_IP"})
+        {
+            # we don't just skip here, because data like flowbits should still be stored in the background
+            $dontadd = 1;
+        }
+      }
+
+      if ($src eq "any" && $neg)
+      {
+        # cant fulfill source "not any"
+        $dontadd = 1;
+      }
+      elsif (ref($src) eq 'ARRAY')
+      {
+        $dontadd = 1;
+        foreach my $item (@{$src})
+        {
+          $dontadd = 0 if ($item eq $local_ip);
+        }
+      }
+      elsif ($src ne "any")
+      {
+        $src = (split(/\//, $dst))[0] if ($dst =~ /\//);
+        $src =~ s/\[//g;
+
+        if ($src ne $local_ip)
         {
             # we don't just skip here, because data like flowbits should still be stored in the background
             $dontadd = 1;
@@ -512,7 +560,7 @@ else ################################################################# SENDER MO
       }
       $additional_data{$item_counter} = \%optionlist;
 
-      $item_counter++;
+      $item_counter++ if (!$dontadd);
     }
 
     # ruleset has been loaded, so we update the status text and enable the actions menu
@@ -550,6 +598,7 @@ else ################################################################# SENDER MO
       {
         push @r, $hlist->itemCget($row, $col, '-text');
       }
+      sleep(0.9); # dont DOS the server
       fire(\@r);
     }
   }
@@ -597,22 +646,11 @@ else ################################################################# SENDER MO
 
   sub benchmark()
   {
-    my $time = 60;
-    my $endtime = time() + ($time ? $time : 1000000);
-    # fires all attacks in the list sequentially
-    for (;time() <= $endtime;)
+    while(1)
     {
-      for (my $i=0; $i<$item_counter; $i++)
-      {
-        my @r;
-        foreach my $col (0 .. $hlist->cget(-columns) - 1)
-        {
-          push @r, $hlist->itemCget($i, $col, '-text');
-        }
-        fire(\@r);
-      }
+    print "Firing all rules.\n";
+      fire_all();
     }
-    print "Benchmark done.\n";
   }
 
   sub fire()
@@ -678,18 +716,32 @@ else ################################################################# SENDER MO
     my $doe = 0;
     my $length_last_content = 0;
     my $is_uri = 0;
-
+    my $uri_count = 0;
     foreach my $key ( sort { (split(/:/, $a))[0] <=> (split(/:/, $b))[0] } keys %{ $additional_data{$id} })
     {
       print "PARSING $key #######################\n\n";
       my $add_data = $additional_data{$id}{$key};
 
-      # CONTENT
-      if ($key =~ /:content/)
+      if ($key =~ /:uricontent/)
       {
-        my $neg = (split(/\"/, $add_data))[0] eq "!";
-
+        #$add_data = "&".$add_data if ($uri_count > 0 && substr($add_data, 0, 1) ne "!");
+        $is_uri = "GET" if (!$is_uri);
+        $uri_count++;
+      }
+      # CONTENT (also applies to uri_content)
+      if ($key =~ /content$/)
+      {
+        my $str = (split(/\"/, $add_data))[0];
+           $str =~ s/^\s+//;
+        my $neg = $str eq "!";
         $add_data =~ s/\"//g;
+
+        if (($add_data eq "POST" || $add_data eq "GET"))
+        {
+          $is_uri = $add_data;
+          next;
+        }
+
         $length_last_content = 0;
         print "got $key: $add_data\n";
         if ($add_data =~ /\|/)
@@ -775,7 +827,7 @@ else ################################################################# SENDER MO
         }
         else
         {
-          print "Payload \"".$add_data."\" has no hex data.\n";
+          print "Payload \"$add_data\" has no hex data.\n";
           my @ws = split(//, $add_data);
           foreach my $ascii (@ws)
           {
@@ -810,24 +862,19 @@ else ################################################################# SENDER MO
         print "end of content. DOE: $doe\n";
           print "TCP payload: ".$payload."\n";
       }
-      elsif ($key =~ /:uricontent/)
-      {
-        $payload .= normalize_uri($add_data);
-        $length_last_content = length(normalize_uri($add_data));
-        $doe .= $length_last_content;
-        $is_uri = 1;
-      }
       elsif ($key =~ /offset/)
       {
         print "offset key: $key\n";
         print "offset: $add_data\n";
         print "payload: $payload\n";
         print "doe: $doe\n";
+        print "llc: $length_last_content\n";
 
-        if ($add_data < $doe) # content should be placed in earlier part of payload
+        if ($add_data < $doe)
         {
-          my $last_content = substr($payload, $doe-$length_last_content, $length_last_content, "");
-          substr($payload, $add_data, $length_last_content, $last_content);
+          #my $last_content = substr($payload, $doe-$length_last_content, $length_last_content, "");
+          #substr($payload, $add_data, $length_last_content, $last_content);
+          $payload .= "x" x $add_data . $payload;
         }
         else
         {
@@ -1219,18 +1266,29 @@ else ################################################################# SENDER MO
       }
       elsif ($key =~ /:dsize/)
       {
+         print "[WARNING] Payload too big. Sending this packet will probably fail.\n" if ($add_data >= 1470);
+         # TODO: maybe try using sockets in this case if we can
+
          if ($add_data =~ /<>/)
          {
-           $payload .= "x" x (split(/<>/, $add_data))[1];
+           $payload .= "x" x ((split(/<>/, $add_data))[1] - length($payload));
          }
          elsif ($add_data =~ /</)
          {
-           $payload .= "x" x ((split(/</, $add_data))[1] - 1);
+           $payload .= "x" x ((split(/</, $add_data))[1] - 1 - length($payload));
          }
          elsif ($add_data =~ />/)
          {
-           $payload .= "x" x ((split(/>/, $add_data))[1] + 1);
+           $payload .= "x" x ((split(/>/, $add_data))[1] + 1 - length($payload));
          }
+         else
+         {
+           $payload .= "x" x ($add_data - length($payload));
+         }
+      }
+      elsif ($key =~ /:id$/)
+      {
+          $ip{ip}->{id} = $add_data;
       }
       elsif ($key =~ /:window/)
       {
@@ -1283,10 +1341,15 @@ else ################################################################# SENDER MO
           }
         }
       }
+      elsif ($key =~ /:icmp_id$/)
+      {
+        $proto{id} = $add_data;
+      }
       # MESSAGE
       elsif ($key =~ /:msg/)
       {
-        # irrelevant to payload
+        # irrelevant to packet
+        print "$add_data\n";
         next;
       }
       else
@@ -1294,22 +1357,13 @@ else ################################################################# SENDER MO
         print "[WARNING] Rule option \"$key\" is not supported.\n";
       }
     }
-
+    $payload = "" if (length($payload) >= 1470);
     $proto{data} = $payload;
 
     for (my $i = 0; $i < $repeat; $i++)
     {
       if ($protocol eq "tcp" || $protocol eq "ip")
       {
-          if ($is_uri)
-          {
-            # for this to work, a webserver like apache2 must be running on the target system
-            # we shortcut creating a http request ourselves by just using the built in module
-            my $request = "http://".$config{"TARGET_IP"}.$payload;
-            get $request;
-            next;
-          }
-
           $rawIP_tcp->set({
             %ip,
             tcp => { %proto }
@@ -1323,8 +1377,8 @@ else ################################################################# SENDER MO
           }
           else
           {
-            print "Requiring handshake.\n";
-            send_request($rawIP_tcp, $from_server, $handshake);
+            print "Requiring handshake.\nFrom_server: $from_server\n";
+            send_request($rawIP_tcp, $from_server, $handshake, $is_uri);
           }
       }
       elsif ($protocol eq "udp")
@@ -1358,6 +1412,9 @@ else ################################################################# SENDER MO
   sub translate_vars()
   {
     my $val = shift;
+       $val =~ s/\[//; # e.g. [$HTTP_PORTS,443]
+       $val =~ s/\]//;
+       $val =~ s/,.*//;
     if ($val =~ s/\$//s)
     {
       my $ret = $config{$val};
@@ -1527,6 +1584,7 @@ else ################################################################# SENDER MO
     my $raw_tcp = shift;
     my $from_server = shift;
     my $established = shift;
+    my $http = shift;
 
     my %ipinfos = %{$raw_tcp->get({ip => [qw(saddr daddr)]})};
     my %tcpinfos = %{$raw_tcp->get({tcp => [qw(source dest data)]})};
@@ -1553,42 +1611,83 @@ else ################################################################# SENDER MO
 
     if (!$from_server && $established)
     {
-      $socket->send("open:".$dst_port) if ($dst_port ne COMM_PORT);
+        my $retry = 1;
+        $dst_port = 8888 if ($dst_port eq COMM_PORT && $http);
+        if ($dst_port ne COMM_PORT || $http)
+        {
+          my $req =  "open:".$dst_port;
+             $req .= ";is_http" if ($http);
+          $socket->send($req);
+          print "sent request: $req\n";
+          my $resp = "";
+          $socket->recv($resp, 1024); # wait for server to open socket
+          print "response: $resp\n";
+          if ($resp eq "OK")
+          {
+            print "Port is now open.\n"
+          }
+          else
+          {
+            print "[WARNING] Problem while opening port.\n";
+          }
+        }
 
-      my $err = '';
-      $pcap = pcap_open_live("eth0", 1024, 0, 0, \$err)
-        or die "Can't open device eth0: $err\n";
+        if ($http)
+        {
+          print "Requesting HTTP\n";
+          my $ua = LWP::UserAgent->new;
+             $ua->agent("BBQ/1.0 ");
 
-      my ($sock);
-      socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
-      bind($sock, pack_sockaddr_in($src_port, (gethostbyname($src_host))[4]));
-      my $paddr = sockaddr_in($dst_port, (gethostbyname($dst_host))[4]);
-      connect($sock, $paddr) or die "connection failed: $!";
+          my $uri = normalize_uri($payload);
+          $uri =~ s/^.// if ((split(//, $uri))[0] eq "/");
 
-      pcap_loop($pcap, -1, \&process_packet, \%tcpinfos);
-      pcap_close($pcap);
+          my $req;
+             $req = HTTP::Request->new(GET  => 'http://'.$config{"TARGET_IP"}.":$dst_port/$uri");
+             $req = HTTP::Request->new(POST => 'http://'.$config{"TARGET_IP"}.":$dst_port/$uri") if ($http eq "POST");
+          print "HTTP RESPONSE: ". $ua->request($req)."\n";
+        }
+        else
+        {
+          print "\ntrying to connect to $dst_port...";
+          my $err = '';
+          $pcap = pcap_open_live("eth0", 1024, 0, 0, \$err)
+            or die "Can't open device eth0: $err\n";
+          while($retry)
+          {
+              $retry = 0;
+              my ($sock);
+              socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
+              bind($sock, pack_sockaddr_in($src_port, (gethostbyname($src_host))[4]));
+              my $paddr = sockaddr_in($dst_port, (gethostbyname($dst_host))[4]);
+              connect($sock, $paddr) or $retry = 1;
+              pcap_loop($pcap, -1, \&process_packet, \%tcpinfos) if (!$retry);
+          }
+          print "\n";
 
-      $socket->send("close") if ($dst_port ne COMM_PORT);
+          pcap_close($pcap);
+      }
+    #  print "requesting to close last port.\n";
+    #  $socket->send("close") if ($dst_port ne COMM_PORT);
     }
     elsif ($from_server && !$established)
     {
       my ($sock);
-      if ($dst_port ne "7777")
+      if ($dst_port ne COMM_PORT)
       {
         socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
         bind($sock, pack_sockaddr_in($dst_port, (gethostbyname($local_ip))[4]));
       }
       $socket->send("send_raw:$src_host,$src_port,$local_ip,$dst_port,".encode_base64($payload, ''));
-      close ($sock) if ($dst_port ne "7777" && $sock);
+      close ($sock) if ($dst_port ne COMM_PORT && $sock);
     }
     elsif ($from_server && $established)
     {
-      print "send:$src_port,$payload\n";
-      $socket->send("send:$src_port,".encode_base64($payload, ''));
       my ($sock);
       socket($sock, AF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
       bind($sock, pack_sockaddr_in($dst_port, (gethostbyname($local_ip))[4]));
       my $resp = "";
+      print "send:$src_port,$payload\n";
+      $socket->send("send:$src_port,".encode_base64($payload, ''));
       $socket->recv($resp, 1024); # wait for server to open socket
       print "response: $resp\n";
       if ($resp eq "OK")
@@ -1596,7 +1695,10 @@ else ################################################################# SENDER MO
         my $paddr = sockaddr_in($src_port, (gethostbyname($dst_host))[4]);
         print "trying to connect to $dst_host:$src_port... ";
         connect($sock, $paddr) or die "connection failed: $!";
+
         print "OK\n";
+        sleep(0.3);
+        shutdown($sock, 2);
       }
       close($sock);
 
