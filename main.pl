@@ -2,8 +2,7 @@
 
 # partially working: uricontent (some weird urls and hex chars not working)
 # experimental: distance, byte_test, byte_jump, offset
-# not working: flowbits
-# implementation not planned: pcre
+# not working: flowbits, pcre
 
 use strict;
 use warnings;
@@ -22,6 +21,7 @@ use LWP::Simple;
 use MIME::Base64 qw( encode_base64 decode_base64 );
 use HTTP::Daemon;
 use HTTP::Client;
+use threads;
 
 use URI::Normalize qw( normalize_uri );
 
@@ -98,7 +98,6 @@ if ($comm eq "-r")
       my $client_port = $client_socket->peerport();
       print "connection from $client_address:$client_port\n";
 
-      # request format: [payload:<payload>;][saddr:<saddr>;][sport:<src_port>;]
       my $request = "";
       $client_socket->recv($request, 1024);
 
@@ -230,6 +229,7 @@ else ################################################################# SENDER MO
             [Button => "Fire All", -command => \&fire_all],
             [Button => "Flood", -command => \&flood],
             [Button => "Benchmark", -command => \&benchmark],
+            [Button => "Benchmark Selected", -command => \&benchmark_selected],
         ],
     ],
     [Button => "Settings", -command => \&open_settings]
@@ -588,6 +588,16 @@ else ################################################################# SENDER MO
     }
   }
 
+  sub benchmark_selected()
+  {
+    my $endtime = time() + 60;
+    while(time() <= $endtime)
+    {
+      sleep 1;
+      fire_selected();
+    }
+  }
+
   # Fire all rules sequentially
   sub fire_all()
   {
@@ -605,57 +615,81 @@ else ################################################################# SENDER MO
 
   sub flood()
   {
-    # we syn flood first and then mix some random attacks in
+    # we udp flood first and then mix some random attacks in
+
+    my $PRE_FLOOD_TIME  =  5; # run udp flood for this amount of seconds until starting to send actual "malware" packets
+    my $PACKET_INTERVAL =  1; # time interval between "malware" packets
+    my $NUM_ATTACKS     = 25; # number of "malware" packets
 
     my $ip = $config{"TARGET_IP"};
-    my $port = int(rand(65534) + 1);
-    my $size = 1024;
-    my $time = 5; # flood for 5 secinds
+    my $port = COMM_PORT;
+    my $size = 512;
 
     my $iaddr = inet_aton("$ip") or die "Cannot resolve hostname $ip\n";
-    my $endtime = time() + ($time ? $time : 1000000);
+    my $endtime = time() + $PRE_FLOOD_TIME;
 
-    socket("flood", PF_INET, SOCK_DGRAM, 17);
-# disabled for faster debugging
-  #  for (;time() <= $endtime;) {
-  #    my $psize = $size ? $size : int(rand(1024-64)+64) ;
-  #    my $pport = $port ? $port : int(rand(65500))+1;
-  #    send("flood", pack("a$psize","flood"), 0, pack_sockaddr_in($pport, $iaddr));
-  #  }
 
-    $endtime = time() + ($time ? $time : 1000000);
-    my $atcks = 0;
-    # now keep flooding but also send "attacks"
-    for (;time() <= $endtime;) {
-      my $psize = $size ? $size : int(rand(1024-64)+64) ;
-      my $pport = $port ? $port : int(rand(65500))+1;
-      send("flood", pack("a$psize","flood"), 0, pack_sockaddr_in($pport, $iaddr));
-      if (int(rand(3)) == 0) # 33% chance
-      {
-          my $row = int(rand($item_counter));
-          my @r;
-          foreach my $col (0 .. $hlist->cget(-columns) - 1)
+    my $thr = threads->create( sub {
+          socket("flood", PF_INET, SOCK_DGRAM, 17);
+          while (1)
           {
-            push @r, $hlist->itemCget($row, $col, '-text');
+            send("flood", pack("a$size","flood"), 0, pack_sockaddr_in($port, $iaddr));
           }
-          $atcks++;
-          fire(\@r);
+      });
+
+
+    sleep $PRE_FLOOD_TIME; # let bbq flood for some time
+
+    $endtime = time() + $PACKET_INTERVAL;
+    # now keep flooding but also send "attacks"
+    for (my $counter = 0; $counter < $NUM_ATTACKS;) {
+      if (time() >= $endtime)
+      {
+        my $row = 1;
+        my @r;
+        foreach my $col (0 .. $hlist->cget(-columns) - 1)
+        {
+          push @r, $hlist->itemCget($row, $col, '-text');
+        }
+
+        fire(\@r);
+
+        $counter++;
+        $endtime = time() + $PACKET_INTERVAL;
+        print "Sent Packet #$counter!\n";
+        foreach my $key (keys %{ $additional_data{"1"} })
+        {
+          if ($key =~ /:sid$/)
+          {
+            print "SID: ".$additional_data{"1"}{$key}."\n";
+            last;
+          }
+        }
       }
     }
   }
 
   sub benchmark()
   {
-    while(1)
+   while(1)
+   {
+    foreach my $row (0 .. $item_counter - 1)
     {
-    print "Firing all rules.\n";
-      fire_all();
+      my @r;
+      foreach my $col (0 .. $hlist->cget(-columns) - 1)
+      {
+        push @r, $hlist->itemCget($row, $col, '-text');
+      }
+      fire(\@r);
+     }   
     }
   }
 
   sub fire()
   {
     my @infos = @{$_[0]};
+
+    my $minsize = 0;
 
     my $id       =                $infos[0];
     my $action   = translate_vars($infos[1]);
@@ -690,7 +724,7 @@ else ################################################################# SENDER MO
     $src_port =~ s/\:.*//;
     if ($src_port =~ /!/)
     {
-      $src_port = (split(/!/, $src_port))[1] - 1;
+      $src_port = (split(/!/, $src_port))[1] + 1;
     }
     print "srcport: $src_port\n";
 
@@ -700,7 +734,7 @@ else ################################################################# SENDER MO
     $dst_port =~ s/\:.*//;
     if ($dst_port =~ /!/)
     {
-      $dst_port = (split(/!/, $dst_port))[1] - 1;
+      $dst_port = (split(/!/, $dst_port))[1] + 1;
     }
     print "dst: $dst_ip:$dst_port\n";
 
@@ -1158,7 +1192,7 @@ else ################################################################# SENDER MO
       elsif ($key =~ /fragbits/)
       {
         # RawIP sets the ip flags via the fragment offset (frag_off)
-        # Flags are 3 bits wide and the offset 13 bits -> 16 bits total
+        # Flags are 3 bits wide and the offset is 13 bits -> 16 bits total
         # Flags are Bit 0: Reserved, Bit 1: Don't Fragment (DF), Bit 2: More Fragments (MF)
 
         # R  DF MF < --  F R A G M E N T   O F F S E T  -->
@@ -1296,14 +1330,7 @@ else ################################################################# SENDER MO
           if ($add_data =~ /!/)
           {
             $win = (split (/!/, $add_data))[1];
-            if ($win == "20")
-            {
-              $win = 10;
-            }
-            else
-            {
-              $win = 20;
-            }
+            $win = $win eq "20" ? "10" : "20";
           }
           $rawIP_tcp->set({ tcp => {window => $win} });
       }
@@ -1357,6 +1384,11 @@ else ################################################################# SENDER MO
         print "[WARNING] Rule option \"$key\" is not supported.\n";
       }
     }
+    if ($minsize > 0)
+    {
+      $payload .= "x" x ($minsize - length($payload));
+    }
+
     $payload = "" if (length($payload) >= 1470);
     $proto{data} = $payload;
 
@@ -1370,6 +1402,14 @@ else ################################################################# SENDER MO
           });
 
           print "Target is: ".$ip{ip}{saddr}.":".$proto{source}."\n";
+          foreach my $key (keys %{ $additional_data{"1"} })
+          {
+            if ($key =~ /:sid$/)
+            {
+              print "SID: ".$additional_data{"1"}{$key}."\n";
+              last;
+            }
+          }
           if (!$handshake && !$from_server)
           {
             $rawIP_tcp->send;
@@ -1666,8 +1706,6 @@ else ################################################################# SENDER MO
 
           pcap_close($pcap);
       }
-    #  print "requesting to close last port.\n";
-    #  $socket->send("close") if ($dst_port ne COMM_PORT);
     }
     elsif ($from_server && !$established)
     {
@@ -1697,7 +1735,7 @@ else ################################################################# SENDER MO
         connect($sock, $paddr) or die "connection failed: $!";
 
         print "OK\n";
-        sleep(0.3);
+      #  sleep(0.3);
         shutdown($sock, 2);
       }
       close($sock);
